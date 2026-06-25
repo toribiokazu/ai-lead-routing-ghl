@@ -1,0 +1,655 @@
+{
+  "name": "AI Lead Routing - GHL Qualification & Assignment",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ghl-lead-inbound",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "node-webhook-trigger",
+      "name": "GHL Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "ghl-lead-inbound",
+      "notes": "Receives inbound lead webhooks from GoHighLevel. Configure in GHL: Settings > Integrations > Webhooks > Add Webhook URL. Fires on: contact.create, form.submitted, opportunity.created"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize lead data from GHL webhook\n// GHL sends different shapes depending on trigger type\nconst body = $input.item.json.body || {};\n\n// Support multiple GHL event types\nconst eventType = body.type || body.event || 'contact.create';\n\n// Extract core lead fields across GHL payload variations\nconst lead = {\n  // Identity\n  ghl_contact_id: body.contact_id || body.id || body.contactId || '',\n  ghl_opportunity_id: body.opportunity_id || body.opportunityId || '',\n  ghl_location_id: body.location_id || body.locationId || '',\n  event_type: eventType,\n\n  // Contact info\n  first_name: body.first_name || body.firstName || body.contact?.firstName || '',\n  last_name: body.last_name || body.lastName || body.contact?.lastName || '',\n  email: body.email || body.contact?.email || '',\n  phone: body.phone || body.phone_number || body.contact?.phone || '',\n  company: body.company_name || body.companyName || body.contact?.companyName || '',\n\n  // Lead intelligence\n  source: body.source || body.lead_source || body.contact?.source || 'Unknown',\n  tags: (body.tags || body.contact?.tags || []).join(', '),\n  custom_fields: JSON.stringify(body.custom_fields || body.customFields || {}),\n  pipeline_stage: body.pipeline_stage_name || body.pipelineStageName || '',\n  pipeline_value: parseFloat(body.monetary_value || body.monetaryValue || 0),\n\n  // Form / message data\n  message: body.message || body.notes || body.contact?.notes || '',\n  form_name: body.form_name || body.formName || '',\n  form_data: JSON.stringify(body.form_fields || body.formData || {}),\n\n  // Metadata\n  received_at: new Date().toISOString(),\n  full_name: `${body.first_name || body.firstName || ''} ${body.last_name || body.lastName || ''}`.trim() || 'Unknown Lead'\n};\n\n// Build enriched context string for AI qualification\nlead.ai_context = [\n  `Name: ${lead.full_name}`,\n  `Email: ${lead.email}`,\n  `Phone: ${lead.phone}`,\n  `Company: ${lead.company || 'Not provided'}`,\n  `Source: ${lead.source}`,\n  `Tags: ${lead.tags || 'None'}`,\n  `Pipeline Stage: ${lead.pipeline_stage || 'New'}`,\n  `Deal Value: $${lead.pipeline_value}`,\n  `Message: ${lead.message || 'None'}`,\n  `Form: ${lead.form_name || 'N/A'}`,\n  `Form Data: ${lead.form_data}`,\n  `Custom Fields: ${lead.custom_fields}`\n].join('\\n');\n\nreturn [{ json: lead }];"
+      },
+      "id": "node-normalize-lead",
+      "name": "Normalize Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400],
+      "notes": "Normalizes the GHL webhook payload into a consistent lead object regardless of which GHL event fired it."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-email",
+              "leftValue": "={{ $json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-validate-lead",
+      "name": "Has Valid Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400],
+      "notes": "Gate: only process leads with an email address. Invalid leads go to the false branch for logging."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "claude-opus-4-6"
+            },
+            {
+              "name": "max_tokens",
+              "value": "1024"
+            },
+            {
+              "name": "system",
+              "value": "You are an expert B2B sales qualification AI. Your job is to analyze inbound leads and score them using BANT criteria (Budget, Authority, Need, Timeline).\n\nYou MUST respond with ONLY valid JSON — no preamble, no markdown, no explanation.\n\nScoring rules:\n- score: integer 1-100 (100 = perfect lead)\n- tier: \"hot\" (score 75-100), \"warm\" (score 45-74), \"cold\" (score 1-44)\n- budget_signal: true if any dollar amounts, company size, or budget language detected\n- authority_signal: true if title suggests decision maker (CEO, Director, VP, Owner, Founder, Manager)\n- need_signal: true if clear problem, pain point, or requirement stated\n- timeline_signal: true if urgency language detected (urgent, ASAP, this month, this quarter, deadline)\n- assigned_team: \"enterprise\" (score ≥80 OR pipeline_value ≥10000), \"smb\" (score 45-79), \"nurture\" (score <45)\n- priority: \"high\" (hot tier), \"medium\" (warm tier), \"low\" (cold tier)\n- qualification_notes: 2-3 sentence summary of why this score\n- follow_up_action: specific recommended first action for the sales rep\n- follow_up_delay_minutes: 0 for hot, 30 for warm, 120 for cold\n\nRespond with exactly this JSON structure:\n{\n  \"score\": 0,\n  \"tier\": \"cold\",\n  \"budget_signal\": false,\n  \"authority_signal\": false,\n  \"need_signal\": false,\n  \"timeline_signal\": false,\n  \"assigned_team\": \"nurture\",\n  \"priority\": \"low\",\n  \"qualification_notes\": \"\",\n  \"follow_up_action\": \"\",\n  \"follow_up_delay_minutes\": 120\n}"
+            },
+            {
+              "name": "messages",
+              "value": "=[{ \"role\": \"user\", \"content\": \"Qualify this inbound lead:\\n\\n{{ $json.ai_context }}\" }]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-ai-qualify",
+      "name": "AI Lead Qualifier",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 340],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "anthropic-api-key",
+          "name": "Anthropic API Key"
+        }
+      },
+      "notes": "Calls Claude to score and qualify the lead using BANT criteria. Returns structured JSON with tier, score, assigned_team, and follow-up recommendations."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude's qualification response\nconst response = $input.item.json;\nconst lead = $('Normalize Lead Data').item.json;\n\nlet qualification;\ntry {\n  const content = response.content?.[0]?.text || '{}';\n  // Strip any accidental markdown\n  const cleaned = content.replace(/```json|```/g, '').trim();\n  qualification = JSON.parse(cleaned);\n} catch (e) {\n  // Fallback if AI response parsing fails\n  qualification = {\n    score: 30,\n    tier: 'cold',\n    budget_signal: false,\n    authority_signal: false,\n    need_signal: false,\n    timeline_signal: false,\n    assigned_team: 'nurture',\n    priority: 'low',\n    qualification_notes: 'AI qualification failed — manual review required.',\n    follow_up_action: 'Review lead manually and qualify.',\n    follow_up_delay_minutes: 60\n  };\n}\n\n// Merge lead + qualification into single enriched object\nreturn [{\n  json: {\n    ...lead,\n    ...qualification,\n    // Routing metadata\n    routed_at: new Date().toISOString(),\n    routing_status: 'pending',\n    // GHL tag to apply\n    ghl_tag: `ai-${qualification.tier}-${qualification.assigned_team}`,\n    // Slack channel by team\n    slack_channel: {\n      enterprise: '#leads-enterprise',\n      smb: '#leads-smb',\n      nurture: '#leads-nurture'\n    }[qualification.assigned_team] || '#leads-general'\n  }\n}];"
+      },
+      "id": "node-parse-qualification",
+      "name": "Parse AI Qualification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 340],
+      "notes": "Parses Claude's JSON response and merges qualification data with the lead object. Handles parse failures gracefully with a fallback scoring."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "is-hot",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "hot",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-route-hot",
+      "name": "Hot Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 340]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "id": "is-warm",
+              "leftValue": "={{ $json.tier }}",
+              "rightValue": "warm",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-route-warm",
+      "name": "Warm Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 520]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rest.gohighlevel.com/v1/contacts/{{ $json.ghl_contact_id }}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\n    \"{{ $json.ghl_tag }}\",\n    \"ai-qualified\",\n    \"score-{{ $json.score }}\"\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-ghl-tag-hot",
+      "name": "GHL: Tag Hot Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 240],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      },
+      "notes": "Tags the GHL contact with ai-hot-enterprise, ai-qualified, and score-{N} for pipeline filtering."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rest.gohighlevel.com/v1/opportunities/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"pipelineId\": \"YOUR_PIPELINE_ID\",\n  \"locationId\": \"{{ $json.ghl_location_id }}\",\n  \"name\": \"{{ $json.full_name }} — {{ $json.company || $json.source }}\",\n  \"pipelineStageId\": \"YOUR_HOT_STAGE_ID\",\n  \"status\": \"open\",\n  \"contactId\": \"{{ $json.ghl_contact_id }}\",\n  \"monetaryValue\": {{ $json.pipeline_value || 0 }},\n  \"assignedTo\": \"YOUR_ENTERPRISE_USER_ID\",\n  \"customFields\": [\n    { \"id\": \"ai_score\", \"value\": \"{{ $json.score }}\" },\n    { \"id\": \"ai_tier\", \"value\": \"{{ $json.tier }}\" },\n    { \"id\": \"ai_notes\", \"value\": \"{{ $json.qualification_notes }}\" },\n    { \"id\": \"ai_next_action\", \"value\": \"{{ $json.follow_up_action }}\" }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-ghl-opportunity-hot",
+      "name": "GHL: Create Hot Opportunity",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      },
+      "notes": "Creates a GHL opportunity in the Enterprise pipeline stage for hot leads. Replace YOUR_PIPELINE_ID, YOUR_HOT_STAGE_ID, and YOUR_ENTERPRISE_USER_ID with real values from your GHL account."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://rest.gohighlevel.com/v1/contacts/tasks/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"title\": \"🔥 HOT LEAD — Call within 5 minutes: {{ $json.full_name }}\",\n  \"body\": \"AI Score: {{ $json.score }}/100\\nTier: HOT\\nTeam: {{ $json.assigned_team }}\\n\\n{{ $json.qualification_notes }}\\n\\nRecommended Action: {{ $json.follow_up_action }}\\n\\nBANT Signals:\\n• Budget: {{ $json.budget_signal }}\\n• Authority: {{ $json.authority_signal }}\\n• Need: {{ $json.need_signal }}\\n• Timeline: {{ $json.timeline_signal }}\",\n  \"dueDate\": \"={{ $now.plus({ minutes: 5 }).toISO() }}\",\n  \"contactId\": \"{{ $json.ghl_contact_id }}\",\n  \"assignedTo\": \"YOUR_ENTERPRISE_USER_ID\",\n  \"status\": \"incompleted\"\n}",
+        "options": {}
+      },
+      "id": "node-ghl-task-hot",
+      "name": "GHL: Create Urgent Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      },
+      "notes": "Creates a 5-minute follow-up task in GHL for hot leads with full AI qualification notes attached."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rest.gohighlevel.com/v1/contacts/{{ $json.ghl_contact_id }}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\"{{ $json.ghl_tag }}\", \"ai-qualified\", \"score-{{ $json.score }}\"]\n}",
+        "options": {}
+      },
+      "id": "node-ghl-tag-warm",
+      "name": "GHL: Tag Warm Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 480],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://rest.gohighlevel.com/v1/contacts/tasks/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"title\": \"♨️ WARM LEAD — Follow up within 30 min: {{ $json.full_name }}\",\n  \"body\": \"AI Score: {{ $json.score }}/100\\nTier: WARM\\nTeam: {{ $json.assigned_team }}\\n\\n{{ $json.qualification_notes }}\\n\\nRecommended Action: {{ $json.follow_up_action }}\",\n  \"dueDate\": \"={{ $now.plus({ minutes: 30 }).toISO() }}\",\n  \"contactId\": \"{{ $json.ghl_contact_id }}\",\n  \"assignedTo\": \"YOUR_SMB_USER_ID\",\n  \"status\": \"incompleted\"\n}",
+        "options": {}
+      },
+      "id": "node-ghl-task-warm",
+      "name": "GHL: Create Warm Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 480],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rest.gohighlevel.com/v1/contacts/{{ $json.ghl_contact_id }}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\"{{ $json.ghl_tag }}\", \"ai-qualified\", \"nurture-sequence\"]\n}",
+        "options": {}
+      },
+      "id": "node-ghl-tag-cold",
+      "name": "GHL: Tag Cold / Nurture",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 660],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://rest.gohighlevel.com/v1/contacts/{{ $json.ghl_contact_id }}/workflow/YOUR_NURTURE_WORKFLOW_ID/subscribe",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.ghlApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-ghl-nurture-enroll",
+      "name": "GHL: Enroll in Nurture Workflow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 660],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ghl-api-key",
+          "name": "GoHighLevel API Key"
+        }
+      },
+      "notes": "Enrolls cold leads into a GHL nurture automation sequence. Replace YOUR_NURTURE_WORKFLOW_ID with your actual GHL workflow ID."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Slack notification message\nconst lead = $input.item.json;\n\n// Tier-based emoji and color\nconst tierConfig = {\n  hot:  { emoji: '🔥', color: '#FF4444', urgency: 'CALL NOW — within 5 minutes' },\n  warm: { emoji: '♨️',  color: '#FF8C00', urgency: 'Follow up within 30 minutes' },\n  cold: { emoji: '🧊',  color: '#4A90D9', urgency: 'Enrolled in nurture sequence' }\n};\n\nconst config = tierConfig[lead.tier] || tierConfig.cold;\n\n// Build BANT signal string\nconst bant = [\n  lead.budget_signal   ? '✅ Budget'   : '❌ Budget',\n  lead.authority_signal ? '✅ Authority' : '❌ Authority',\n  lead.need_signal      ? '✅ Need'     : '❌ Need',\n  lead.timeline_signal  ? '✅ Timeline' : '❌ Timeline'\n].join('  ');\n\n// Score bar (visual)\nconst filled = Math.round((lead.score / 100) * 10);\nconst scoreBar = '█'.repeat(filled) + '░'.repeat(10 - filled);\n\nreturn [{\n  json: {\n    ...lead,\n    slack_message: {\n      channel: lead.slack_channel,\n      text: `${config.emoji} New ${lead.tier.toUpperCase()} Lead: ${lead.full_name}`,\n      attachments: [\n        {\n          color: config.color,\n          blocks: [\n            {\n              type: 'header',\n              text: {\n                type: 'plain_text',\n                text: `${config.emoji} ${lead.tier.toUpperCase()} LEAD — ${config.urgency}`\n              }\n            },\n            {\n              type: 'section',\n              fields: [\n                { type: 'mrkdwn', text: `*Name:*\\n${lead.full_name}` },\n                { type: 'mrkdwn', text: `*Company:*\\n${lead.company || 'N/A'}` },\n                { type: 'mrkdwn', text: `*Email:*\\n${lead.email}` },\n                { type: 'mrkdwn', text: `*Phone:*\\n${lead.phone || 'N/A'}` },\n                { type: 'mrkdwn', text: `*Source:*\\n${lead.source}` },\n                { type: 'mrkdwn', text: `*Deal Value:*\\n$${lead.pipeline_value || 0}` }\n              ]\n            },\n            {\n              type: 'section',\n              text: {\n                type: 'mrkdwn',\n                text: `*AI Score:* ${lead.score}/100  \\`${scoreBar}\\`\\n*BANT:* ${bant}`\n              }\n            },\n            {\n              type: 'section',\n              text: {\n                type: 'mrkdwn',\n                text: `*AI Analysis:*\\n${lead.qualification_notes}`\n              }\n            },\n            {\n              type: 'section',\n              text: {\n                type: 'mrkdwn',\n                text: `*📋 Recommended Action:*\\n${lead.follow_up_action}`\n              }\n            },\n            {\n              type: 'section',\n              text: {\n                type: 'mrkdwn',\n                text: `*Team:* ${lead.assigned_team.toUpperCase()}  |  *Priority:* ${lead.priority.toUpperCase()}  |  *GHL Tag:* \\`${lead.ghl_tag}\\``\n              }\n            }\n          ]\n        }\n      ]\n    }\n  }\n}];"
+      },
+      "id": "node-build-slack",
+      "name": "Build Slack Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 440],
+      "notes": "Builds a rich Slack Block Kit message with lead details, AI score bar, BANT breakdown, and routing info."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.slackBotToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack_message) }}",
+        "options": {}
+      },
+      "id": "node-slack-notify",
+      "name": "Slack: Notify Sales Team",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 440],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "slack-bot-token",
+          "name": "Slack Bot Token"
+        }
+      },
+      "notes": "Posts the AI-scored lead notification to the appropriate Slack channel based on tier (#leads-enterprise, #leads-smb, #leads-nurture)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log the full routing result for analytics\nconst lead = $('Parse AI Qualification').item.json;\nconst slackResult = $input.item.json;\n\nconsole.log(JSON.stringify({\n  event: 'lead_routed',\n  contact_id: lead.ghl_contact_id,\n  full_name: lead.full_name,\n  email: lead.email,\n  score: lead.score,\n  tier: lead.tier,\n  assigned_team: lead.assigned_team,\n  priority: lead.priority,\n  source: lead.source,\n  pipeline_value: lead.pipeline_value,\n  budget_signal: lead.budget_signal,\n  authority_signal: lead.authority_signal,\n  need_signal: lead.need_signal,\n  timeline_signal: lead.timeline_signal,\n  routed_at: lead.routed_at,\n  slack_ok: slackResult.ok || false\n}));\n\nreturn [{ json: { status: 'routed', lead_id: lead.ghl_contact_id, tier: lead.tier, score: lead.score } }];"
+      },
+      "id": "node-log-result",
+      "name": "Log Routing Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 440],
+      "notes": "Logs the full routing result for analytics. In production, swap console.log for a database insert or a call to your analytics platform."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $credentials.slackBotToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"#leads-ops\",\n  \"text\": \"⚠️ Invalid lead dropped — missing email\",\n  \"attachments\": [{\n    \"color\": \"#FF0000\",\n    \"text\": \"Contact ID: {{ $('Normalize Lead Data').item.json.ghl_contact_id }}\\nName: {{ $('Normalize Lead Data').item.json.full_name }}\\nSource: {{ $('Normalize Lead Data').item.json.source }}\\nDropped at: {{ $now }}\"\n  }]\n}",
+        "options": {}
+      },
+      "id": "node-log-invalid",
+      "name": "Log Invalid Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 560],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "slack-bot-token",
+          "name": "Slack Bot Token"
+        }
+      },
+      "notes": "Sends a warning to #leads-ops for any lead missing an email address so the team can investigate the source."
+    }
+  ],
+  "connections": {
+    "GHL Lead Webhook": {
+      "main": [
+        [{ "node": "Normalize Lead Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Lead Data": {
+      "main": [
+        [{ "node": "Has Valid Email?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Valid Email?": {
+      "main": [
+        [{ "node": "AI Lead Qualifier", "type": "main", "index": 0 }],
+        [{ "node": "Log Invalid Lead", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Lead Qualifier": {
+      "main": [
+        [{ "node": "Parse AI Qualification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse AI Qualification": {
+      "main": [
+        [{ "node": "Hot Lead?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Hot Lead?": {
+      "main": [
+        [
+          { "node": "GHL: Tag Hot Lead", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Warm Lead?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "GHL: Tag Hot Lead": {
+      "main": [
+        [
+          { "node": "GHL: Create Hot Opportunity", "type": "main", "index": 0 },
+          { "node": "GHL: Create Urgent Task", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Warm Lead?": {
+      "main": [
+        [
+          { "node": "GHL: Tag Warm Lead", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "GHL: Tag Cold / Nurture", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "GHL: Tag Warm Lead": {
+      "main": [
+        [{ "node": "GHL: Create Warm Task", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Tag Cold / Nurture": {
+      "main": [
+        [{ "node": "GHL: Enroll in Nurture Workflow", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Create Hot Opportunity": {
+      "main": [
+        [{ "node": "Build Slack Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Create Urgent Task": {
+      "main": [
+        [{ "node": "Build Slack Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Create Warm Task": {
+      "main": [
+        [{ "node": "Build Slack Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "GHL: Enroll in Nurture Workflow": {
+      "main": [
+        [{ "node": "Build Slack Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Slack Notification": {
+      "main": [
+        [{ "node": "Slack: Notify Sales Team", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: Notify Sales Team": {
+      "main": [
+        [{ "node": "Log Routing Result", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "lead-routing" },
+    { "name": "gohighlevel" },
+    { "name": "ai-automation" }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": ""
+  },
+  "id": "",
+  "versionId": ""
+}
